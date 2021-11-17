@@ -1,0 +1,324 @@
+substitutions:
+  roomname: bedroomesp32
+  ip: 10.0.0.xxx
+  yourname: xxx
+  ssid: !secret wifi_ssid1
+  ssid1: !secret wifi_ssid
+  humidity_offset: "0.0"
+
+esphome:
+  name: $roomname
+  platform: ESP32
+  board: esp32dev
+  on_boot:
+    priority: -100.0
+    then:
+      - switch.turn_off: ${roomname}_buzzer
+      - script.execute: buzzer_script_short_dnd
+      - delay: 10ms
+      - switch.turn_off: ${roomname}_buzzer
+      - script.execute: presence_timeout
+    #   - lambda: |-
+    #         id(apple_watch_rssi).publish_state(-99);
+
+globals:
+  - id: tx_power
+    type: float
+    initial_value: '-72.0'
+  - id: max_water_level
+    type: float
+    initial_value: !secret max_water_level
+    
+# Enable logging
+logger:
+  level: !secret log_level
+  
+syslog:
+    ip_address: "10.0.0.xxx"
+    port: 514
+
+# Enable Home Assistant API
+api:
+  password: !secret api_passwd
+  reboot_timeout: !secret reboot_timeout
+  services:
+    - service: buzzer_script_dnd
+      then:
+        - if:
+            condition:
+              not:
+                binary_sensor.is_on: ha_do_not_disturb_ib
+            then:
+              - switch.turn_on: ${roomname}_buzzer
+              - delay: 500ms
+              - switch.turn_off: ${roomname}_buzzer
+    - service: buzzer_script_short_dnd
+      then:
+        - if:
+            condition:
+              not:
+                binary_sensor.is_on: ha_do_not_disturb_ib
+            then:
+              - switch.turn_on: ${roomname}_buzzer
+              - delay: 5ms
+              - switch.turn_off: ${roomname}_buzzer
+
+ota:
+  password: !secret ota_passwd
+
+wifi:
+  networks:
+    - ssid: $ssid
+      password: !secret wifi_password
+      priority: 2
+    - ssid: $ssid1
+      password: !secret wifi_password
+      priority: 1
+  use_address: $ip
+  domain: .my.local
+  reboot_timeout: !secret reboot_timeout
+  manual_ip:
+    static_ip: $ip
+    gateway: 10.0.0.1
+    subnet: 255.255.255.0
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: ${roomname}_ESP32
+    password: !secret wifi_bkp_password
+    
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: ${roomname}_IP_Address
+    ssid:
+      name: ${roomname}_ESP_Connected_SSID
+      id: wifi_info_ssid_sensor
+    bssid:
+      name: ${roomname}_ESP_Connected_BSSID
+    mac_address:
+      name: ${roomname}_ESP_Mac_Wifi_Address
+  - platform: homeassistant
+    name: XXX ESP32 Room
+    entity_id: input_select.xxx_esp32_room_is
+    id: xxx_esp32_room
+    internal: true
+
+captive_portal:
+
+interval:
+  - interval: 5s
+    then:
+      - if:
+          condition:
+            not:
+              - script.is_running: presence_timeout
+          then:
+            - logger.log: 
+                format: "presence_timeout script not running"
+                level: WARN
+            - script.execute: presence_timeout
+
+switch:
+  - platform: restart
+    name: ${roomname}_Restart
+    id: ${roomname}_restart_switch
+  - platform: gpio
+    pin: 12
+    id: ${roomname}_buzzer
+    name: ${roomname}_Buzzer
+    icon: "mdi:bullhorn"
+    restore_mode: RESTORE_DEFAULT_OFF
+    on_turn_on:
+        - script.execute: buzzer_script_turn_off
+    #   - logger.log: 
+    #       format: "Switch Turned On!"
+    #       level: INFO
+    # on_turn_off:
+    #   - logger.log: 
+    #       format: "Switch Turned Off!"
+    #       level: INFO
+              
+time:
+  - platform: homeassistant
+    id: esptime
+
+i2c:
+    sda: 4
+    scl: 15
+    frequency: 10kHz
+    scan: True
+
+font:
+  - file: "fonts/ComicSansMS3.ttf"
+    id: my_font
+    size: 20
+  - file: "fonts/ComicSansMS3.ttf"
+    id: my_font_small
+    size: 12
+
+display:
+  - platform: ssd1306_i2c
+    model: "SSD1306 128x64"
+    reset_pin: 16
+    address: 0x3C
+    update_interval: 5s
+    lambda: |-
+      it.strftime(64, 0, id(my_font), TextAlign::TOP_CENTER, "%H:%M", id(esptime).now());
+      it.printf(8, 24, id(my_font_small), "%s / %.1f", id(xxx_esp32_room).state.c_str(), id(apple_watch_rssi).state);
+      it.printf(4, 44, id(my_font_small), "%s / %s / %.1f", id(esp32_status).state ? "ON" : "OFF", id(wifi_info_ssid_sensor).state.c_str(), id(wifi_signal_sensor).state);
+
+esp32_ble_tracker:
+  scan_parameters:
+    interval: !secret ble_interval # 1.2s 3s 5s 2.2s
+    window:  !secret ble_window # 500ms
+    active: false
+  on_ble_advertise:
+    - then:
+      - lambda: |-
+          optional<int16_t> best_rssi = nullopt;
+          for (auto data : x.get_manufacturer_datas()) {
+            if (data.data.size() < 4 || data.uuid.to_string() != "0x004C" || data.data[0] != 0x10 || data.data[1] < 5) {
+              continue;
+            }
+            const int16_t rssi = x.get_rssi();
+            const uint8_t status_flags = data.data[2] >> 4;  // High nibble
+            const uint8_t data_flags = data.data[3];
+            if (data_flags == 0x98 || data_flags == 0x18) {
+              if (status_flags == 0 || status_flags == 2) {
+                best_rssi = max(rssi, best_rssi.value_or(rssi));
+                ESP_LOGD("ble_adv", "Found Apple Watch (mac %s) rssi %i, best_rssi %i", x.address_str().c_str(), rssi, *best_rssi);
+              } else {
+                ESP_LOGD("ble_adv", "Possible Apple Watch? (mac %s) rssi %i, unrecognised status/action flags %#04x", x.address_str().c_str(), rssi, data.data[2]);
+              }
+            }
+          }
+          if (best_rssi) {
+            id(apple_watch_rssi).publish_state(*best_rssi);
+          }
+
+sensor:
+  - platform: adc
+    pin: 36
+    name: "${roomname}_Water_Level"
+    id: "${roomname}_water_level"
+    update_interval: 2s
+    attenuation: 11db
+    on_value:
+      then:
+      - if:
+          condition:
+            lambda: 'return x > id(max_water_level);'
+          then:
+            script.execute: buzzer_script
+  - platform: dht
+    pin: 13
+    model: DHT22_TYPE2
+    # model: AM2302
+    temperature:
+      name: "${roomname}_Temperature"
+      filters:
+        - lambda: |-
+            return (int) x;
+    humidity:
+      name: "${roomname}_Humidity"
+      filters:
+        - lambda: |-
+            return (int) (x + $humidity_offset);
+    update_interval: 60s
+  - platform: wifi_signal
+    name: "${roomname}_WiFi_Signal"
+    id: wifi_signal_sensor
+    update_interval: 60s
+  - platform: template
+    id: apple_watch_rssi_raw
+    name: "$yourname Apple Watch $roomname RSSI raw"
+    device_class: signal_strength
+    unit_of_measurement: dBm
+    accuracy_decimals: 0
+    filters:
+      - throttle: 1s
+  - platform: template
+    id: apple_watch_rssi
+    name: "$yourname Apple Watch $roomname RSSI"
+    device_class: signal_strength
+    unit_of_measurement: dBm
+    accuracy_decimals: 0
+    force_update: true
+    filters:
+      - exponential_moving_average:
+          alpha: 0.3
+          send_every: 1
+      - sliding_window_moving_average:
+          window_size: 3
+          send_every: 1
+      - filter_out: 0.0
+    #   - throttle: 1s
+    on_raw_value:
+      then:
+        # - script.execute: presence_timeout  # Publish -99 if no rssi received
+        - lambda: |-
+            id(apple_watch_rssi_raw).publish_state(x);
+    on_value:
+      then:
+        - script.execute: presence_timeout  # Publish -99 if no rssi received
+  - platform: homeassistant
+    name: XXX ESP32 Best RSSI
+    entity_id: input_number.xxx_esp32_best_rssi
+    id: xxx_esp32_best_rssi
+    internal: true
+
+binary_sensor:
+  - platform: status
+    name: ${roomname}_Status
+    id: esp32_status
+  - platform: homeassistant
+    name: "HA DND IB"
+    entity_id: input_boolean.do_not_disturb_ib
+    id: ha_do_not_disturb_ib
+    internal: true
+
+script:
+  # Publish event every 30 seconds when no rssi received
+  - id: presence_timeout
+    mode: restart
+    then:
+      - delay: !secret presence_timeout
+    #   - logger.log: 
+    #       format: "No RSSI received"
+    #       level: INFO
+      - lambda: |-
+            if (id(apple_watch_rssi).state != -100) {
+                id(apple_watch_rssi).publish_state(-100); 
+            }
+      - script.execute: presence_timeout
+  - id: buzzer_script
+    then:
+      - switch.turn_on: ${roomname}_buzzer
+      - delay: 500ms
+      - switch.turn_off: ${roomname}_buzzer
+  - id: buzzer_script_dnd
+    then:
+      - if:
+          condition:
+            not:
+              binary_sensor.is_on: ha_do_not_disturb_ib
+          then:
+            - switch.turn_on: ${roomname}_buzzer
+            - delay: 500ms
+            - switch.turn_off: ${roomname}_buzzer
+  - id: buzzer_script_short_dnd
+    then:
+      - if:
+          condition:
+            not:
+              binary_sensor.is_on: ha_do_not_disturb_ib
+          then:
+            - switch.turn_on: ${roomname}_buzzer
+            - delay: 5ms
+            - switch.turn_off: ${roomname}_buzzer
+  - id: buzzer_script_turn_off
+    mode: single
+    then:
+      - delay: 1s
+      - switch.turn_off: ${roomname}_buzzer
+
